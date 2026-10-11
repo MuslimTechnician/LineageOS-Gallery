@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # daily 06:00 UTC
+  workflow_dispatch:        # manual trigger
+
+permissions:
+  contents: write
+
+env:
+  TRACK_BRANCH: lineage-23.2
+  LOS_REPO: LineageOS/android_packages_apps_Glimpse
+
+jobs:
+  # ── 1. Decide whether there is anything new upstream ───────────────
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.detect.outputs.changed }}
+      sha: ${{ steps.detect.outputs.sha }}
+      last_tag: ${{ steps.detect.outputs.last_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # need tags + history
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${{ env.LOS_REPO }}.git" || true
+          git fetch --no-tags upstream "${{ env.TRACK_BRANCH }}"
+
+      - name: Detect change
+        id: detect
+        run: |
+          SHA=$(git rev-parse "upstream/${{ env.TRACK_BRANCH }}")
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+          # latest release tag of the form 23.2-YYYY.MM.DD
+          LAST_TAG=$(git tag -l '23.2-*' --sort=-creatordate | head -n1)
+          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$LAST_TAG" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"        # first release
+            exit 0
+          fi
+
+          # the upstream SHA recorded inside that tag's annotation
+          LAST_SHA=$(git tag -n99 "$LAST_TAG" \
+                     | grep -oE 'Source: [0-9a-f]{40}' \
+                     | head -n1 | awk '{print $2}')
+
+          if [ "$LAST_SHA" = "$SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"       # nothing new
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── 2. Build + publish ─────────────────────────────────────────────
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream + checkout source commit
+        run: |
+          git remote add upstream "https://github.com/${{ env.LOS_REPO }}.git" || true
+          git fetch --no-tags upstream "${{ env.TRACK_BRANCH }}"
+          git checkout "${{ needs.check.outputs.sha }}"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Decode keystore
+        run: echo "${{ secrets.MT_KEYSTORE }}" | base64 -d > "$RUNNER_TEMP/mt.keystore"
+
+      - name: Inject version + signing
+        run: |
+          DATE=$(date -u +%Y.%m.%d)
+          DATECODE=$(date -u +%Y%m%d)
+          VERSION_NAME="23.2-${DATE}"
+
+          # rename package → org.lineageos.gallery (avoids clash with system gallery)
+          sed -i 's/applicationId = "org.lineageos.glimpse"/applicationId = "org.lineageos.gallery"/' app/build.gradle.kts
+
+          # versionCode / versionName
+          sed -i "s/versionCode = 1/versionCode = ${DATECODE}/" app/build.gradle.kts
+          sed -i "s/versionName = \"1.0\"/versionName = \"${VERSION_NAME}\"/" app/build.gradle.kts
+
+          # signing config (extra android{} block — Gradle merges them)
+          cat >> app/build.gradle.kts <<'EOF'
+
+          android {
+              signingConfigs {
+                  create("release") {
+                      storeFile = file(System.getenv("MT_KEYSTORE_PATH") ?: "")
+                      storePassword = System.getenv("MT_KEYSTORE_PASSWORD")
+                      keyAlias = System.getenv("MT_KEY_ALIAS")
+                      keyPassword = System.getenv("MT_KEY_PASSWORD")
+                  }
+              }
+              buildTypes {
+                  getByName("release") {
+                      signingConfig = signingConfigs.getByName("release")
+                  }
+              }
+          }
+          EOF
+
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        run: ./gradlew assembleRelease
+        env:
+          MT_KEYSTORE_PATH: ${{ runner.temp }}/mt.keystore
+          MT_KEYSTORE_PASSWORD: ${{ secrets.MT_KEYSTORE_PASSWORD }}
+          MT_KEY_ALIAS: ${{ secrets.MT_KEY_ALIAS }}
+          MT_KEY_PASSWORD: ${{ secrets.MT_KEY_PASSWORD }}
+
+      - name: Generate release notes (all commits since last release)
+        run: |
+          SHA="${{ needs.check.outputs.sha }}"
+          LAST_TAG="${{ needs.check.outputs.last_tag }}"
+          {
+            echo "Synced with LineageOS \`${{ env.TRACK_BRANCH }}\` @ \`${SHA:0:7}\`."
+            echo ""
+            if [ -n "$LAST_TAG" ]; then
+              echo "### Changes since ${LAST_TAG}"
+              echo '```'
+              git log --oneline --no-decorate "${LAST_TAG}..${SHA}"
+              echo '```'
+            else
+              echo "### Commits"
+              echo '```'
+              git log --oneline --no-decorate -30 "${SHA}"
+              echo '```'
+            fi
+          } > release_notes.md
+          cat release_notes.md
+
+      - name: Tag + publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag -a "${{ env.VERSION_NAME }}" -m "Source: ${{ needs.check.outputs.sha }}"
+          git push origin "${{ env.VERSION_NAME }}"
+          gh release create "${{ env.VERSION_NAME }}" \
+            app/build/outputs/apk/release/app-release.apk \
+            --title "Gallery ${{ env.VERSION_NAME }}" \
+            --notes-file release_notes.md
