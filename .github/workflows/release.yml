@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  TRACK_BRANCH: lineage-23.2
+  TRACK_BRANCH: lineage-24.0
   LOS_REPO: LineageOS/android_packages_apps_Glimpse
 
 jobs:
@@ -37,7 +37,7 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
           # latest release tag of the form 23.2-YYYY.MM.DD
-          LAST_TAG=$(git tag -l '23.2-*' --sort=-creatordate | head -n1)
+          LAST_TAG=$(git tag -l '24.0-*' --sort=-creatordate | head -n1)
           echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
 
           if [ -z "$LAST_TAG" ]; then
@@ -94,7 +94,7 @@ jobs:
         run: |
           DATE=$(date -u +%Y.%m.%d)
           DATECODE=$(date -u +%Y%m%d)
-          VERSION_NAME="23.2-${DATE}"
+          VERSION_NAME="24.0-${DATE}"
 
           # rename package → org.lineageos.gallery (avoids clash with system gallery)
           sed -i 's/applicationId = "org.lineageos.glimpse"/applicationId = "org.lineageos.gallery"/' app/build.gradle.kts
@@ -154,15 +154,17 @@ jobs:
           } > release_notes.md
           cat release_notes.md
 
-      - name: Tag + publish release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag upstream SHA (annotated)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${{ env.VERSION_NAME }}" -m "Source: ${{ needs.check.outputs.sha }}"
-          git push origin "${{ env.VERSION_NAME }}"
-          gh release create "${{ env.VERSION_NAME }}" \
-            app/build/outputs/apk/release/app-release.apk \
-            --title "Gallery ${{ env.VERSION_NAME }}" \
-            --notes-file release_notes.md
+          git push origin "refs/tags/${{ env.VERSION_NAME }}"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION_NAME }}
+          name: Gallery ${{ env.VERSION_NAME }}
+          body_path: release_notes.md
+          files: app/build/outputs/apk/release/app-release.apk
