@@ -77,7 +77,15 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
+      - name: Setup Android SDK
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SM="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort | tail -n1)"
+          [ -n "$SM" ] || SM="$(command -v sdkmanager)"
+          echo "Using sdkmanager: $SM"
+          yes | "$SM" --licenses >/dev/null 2>&1 || true
+          "$SM" "platforms;android-36" "build-tools;36.0.0"
 
       - name: Decode keystore
         run: echo "${{ secrets.MT_KEYSTORE }}" | base64 -d > "$RUNNER_TEMP/mt.keystore"
